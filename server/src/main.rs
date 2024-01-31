@@ -4,8 +4,7 @@ use std::fmt::Debug;
 use std::process::exit;
 use std::{net::SocketAddr, str, sync::Arc};
 use net::*;
-use tokio::sync::*;
-use tokio::task::yield_now;
+use tokio::{select, sync::*};
 use tokio::io::*;
 
 const LISTEN_ADDR: &str = "0.0.0.0:5566";
@@ -109,7 +108,7 @@ impl CertificationCenter {
                 // 如果房间为空了就删除房间
                 if len == 0 {
                     let rom = lock.remove(*rid);
-                    println!("{:?} Room was destroyed", rom);
+                    println!("{:?} was destroyed", rom);
                 }
             }
         }
@@ -225,36 +224,26 @@ impl Process {
 
         let mut reader = TryRead::new();
         loop {
-            match reader.poll(&mut self.stm) {
-                Ok(_) => {
-                    reader.clear();
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { }
-                Err(_) => {
-                    break;
-                }
-            }
-            if let Ok(ci) = rx.try_recv() {
-                write(&mut self.stm, &serde_json::to_vec(&ci)?).await?;
-            }
-            yield_now().await;
-        }
-        // 退出
-        let mut lock = self.all_rooms.lock().await;
-        for rid in self.room.iter() {
-            if let None = lock.by_id.get(&rid) {
-                continue;
-            }
-            // 获取删除自己后房间剩余的人数
-            let len: usize = {
-                let rom = lock.by_id.get_mut(rid).unwrap();
-                rom.cs.remove(&self.user.id);
-                rom.cs.len()
+            select! {
+                res = self.stm.readable() => {
+                    if let Ok(_) = res {
+                        match reader.poll(&mut self.stm) {
+                            Ok(_) => {
+                                reader.clear();
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { }
+                            Err(_) => { break; }
+                        }
+                    } else {
+                        break;
+                    }
+                },
+                c = rx.recv() => {
+                    if let Some(c) = c {
+                        write(&mut self.stm, &serde_json::to_vec(&c)?).await?;
+                    }
+                },
             };
-            // 如果房间为空了就删除房间
-            if len == 0 {
-                lock.remove(*rid);
-            }
         }
         Ok(())
     }
