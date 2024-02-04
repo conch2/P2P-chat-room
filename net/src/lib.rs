@@ -16,7 +16,8 @@ pub struct BaseUserInfo {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
-    pub user_info: BaseUserInfo,
+    pub id: u32,
+    pub name: String,
     pub addr: SocketAddr,
 }
 

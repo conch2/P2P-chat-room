@@ -1,17 +1,25 @@
 use tokio::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
+use std::env;
 use std::fmt::Debug;
 use std::process::exit;
 use std::{net::SocketAddr, str, sync::Arc};
 use net::*;
-use tokio::{select, sync::*};
+use tokio::sync::*;
 use tokio::io::*;
 
 const LISTEN_ADDR: &str = "0.0.0.0:5566";
 
 #[tokio::main]
 async fn main() {
-    Server::new(LISTEN_ADDR).await
+    // 默认端口5566
+    let mut addr: String = LISTEN_ADDR.into();
+    if env::args().len() > 1 {
+        let mut args = env::args();
+        let port = { args.nth(1).unwrap() };
+        addr = format!("0.0.0.0:{}", port);
+    }
+    Server::new(&addr).await
         .run().await;
 }
 
@@ -23,10 +31,18 @@ struct Server {
 }
 
 impl Server {
+    /// 初始化一个服务
     async fn new(addr: &str) -> Self {
         Server {
             addr: addr.into(),
-            listener: TcpListener::bind(addr).await.unwrap(),
+            listener: {
+                if let Ok(listener) = TcpListener::bind(addr).await {
+                    listener
+                } else {
+                    println!("请检查该地址是否正确：{}", addr);
+                    exit(1);
+                }
+            },
             rooms: Arc::new(Mutex::new(AllRoomInfo::new())),
             users: Arc::new(Mutex::new(AllUserInfo::default())),
         }
@@ -84,36 +100,21 @@ impl CertificationCenter {
             users.insert(&mut user);
         }
         write(&mut stm, "OK".as_bytes()).await.unwrap();
+        // 将用户信息反馈给客户端
+        let base_info = BaseUserInfo {
+            id: user.id,
+            name: user.name.clone(),
+        };
+        write(&mut stm, &serde_json::to_vec(&base_info).unwrap()).await.unwrap();
         println!("{}: {:?}", &addr, &user);
-        let uid = user.id;
+        let _uid = user.id;
         let mut prcs = Process::new(user, stm, addr, rooms.clone());
         prcs.poll().await.ok();
-        {
-            let mut users = users.lock().await;
-            users.remove(uid);
-            println!("{}: Quit {:?}", prcs.addr, prcs.user);
-        } {
-            // 退出
-            let mut lock = rooms.lock().await;
-            for rid in prcs.room.iter() {
-                if let None = lock.by_id.get(&rid) {
-                    continue;
-                }
-                // 获取删除自己后房间剩余的人数
-                let len: usize = {
-                    let rom = lock.by_id.get_mut(rid).unwrap();
-                    rom.cs.remove(&prcs.user.id);
-                    rom.cs.len()
-                };
-                // 如果房间为空了就删除房间
-                if len == 0 {
-                    let rom = lock.remove(*rid);
-                    println!("{:?} was destroyed", rom);
-                }
-            }
-        }
+        println!("{}: Quit {:?}", prcs.addr, prcs.user);
     }
 
+    /// 等待用户登录
+    /// 成功返回用户信息
     async fn wait_login(mut stm: &mut TcpStream, users: Arc<Mutex<AllUserInfo>>) -> Result<User> {
         loop {
             let pack = read(stm).await?;
@@ -210,10 +211,9 @@ impl Process {
     }
 
     async fn poll(&mut self) -> Result<()> {
-        let (tx, mut rx) = mpsc::channel::<ClientInfo>(64);
         // 接收客户端传过来的房间信息
         let _ = loop {
-            match self.inst_room(tx.clone()).await {
+            match self.inst_room().await {
                 Ok(r) => break r,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     write(&mut self.stm, "Fail to join room".as_bytes()).await?;
@@ -221,35 +221,25 @@ impl Process {
                 Err(e) => { return Err(e); }
             }
         };
-
-        let mut reader = TryRead::new();
         loop {
-            select! {
-                res = self.stm.readable() => {
-                    if let Ok(_) = res {
-                        match reader.poll(&mut self.stm) {
-                            Ok(_) => {
-                                reader.clear();
-                            }
-                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { }
-                            Err(_) => { break; }
-                        }
-                    } else {
-                        break;
-                    }
-                },
-                c = rx.recv() => {
-                    if let Some(c) = c {
-                        write(&mut self.stm, &serde_json::to_vec(&c)?).await?;
-                    }
-                },
-            };
+            match net::read(&mut self.stm).await {
+                Ok(_) => { }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { }
+                Err(_) => { break; }
+            }
         }
         Ok(())
     }
 
-    async fn inst_room(&mut self, tx: mpsc::Sender<ClientInfo>) -> Result<Room> {
-        let mut room: Room = read(&mut self.stm).await?.into();
+    async fn inst_room(&mut self) -> Result<Room> {
+        let mut room: Room = {
+            let pkg = read(&mut self.stm).await?;
+            if let Ok(rom) = serde_json::from_slice(pkg.as_slice()) {
+                rom
+            } else {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+        };
         let mut lock = self.all_rooms.lock().await;
         let AllRoomInfo {
             by_id: rooms,
@@ -285,13 +275,7 @@ impl Process {
                 // 加入房间
                 let r = rooms.get_mut(&room.id).unwrap();
                 if r.name == room.name && r.passwd == room.passwd {
-                    let cr_info = ClientInfo {
-                        user_info: BaseUserInfo {
-                            id: self.user.id.clone(),
-                            name: self.user.name.clone(),
-                        },
-                        addr: self.addr.clone()
-                    };
+                    // 发送加入成功，并将完整房间信息发送过去
                     write(&mut self.stm, "OK".as_bytes()).await?;
                     let rom = Room {
                         id: r.id,
@@ -299,16 +283,21 @@ impl Process {
                         passwd: r.passwd.clone(),
                     };
                     write(&mut self.stm, &serde_json::to_vec(&rom)?).await?;
+
+                    let mut cis = Vec::new();
                     for (_, client) in r.cs.iter() {
-                        let ci = ClientInfo{user_info: client.user_info.clone(), addr: client.addr.clone()};
-                        write(&mut self.stm, &serde_json::to_vec::<ClientInfo>(&ci).unwrap()).await?;
-                        client.tx.send(cr_info.clone()).await.unwrap();
+                        let ci = ClientInfo{id: client.id, name: client.name.clone(), addr: client.addr.clone()};
+                        cis.push(ci);
                     }
                     r.cs.insert(self.user.id, Client {
-                        user_info: BaseUserInfo{ id: self.user.id, name: self.user.name.clone() },
+                        id: self.user.id,
+                        name: self.user.name.clone(),
                         addr: self.addr.clone(),
-                        tx: tx.clone(),
                     });
+                    // 放开锁
+                    { let _lock = lock; }
+                    // 将所有房间内的客户端发送
+                    write(&mut self.stm, &serde_json::to_vec(&cis).unwrap()).await?;
                 } else {
                     return Err(std::io::ErrorKind::WouldBlock.into());
                 }
@@ -317,9 +306,9 @@ impl Process {
             // 新建房间
             let mut cs = HashMap::new();
             cs.insert(self.user.id, Client {
-                user_info: BaseUserInfo{ id: self.user.id, name: self.user.name.clone() },
+                id: self.user.id,
+                name: self.user.name.clone(),
                 addr: self.addr.clone(),
-                tx: tx.clone(),
             });
             let r = RoomFull { id: room.id, name: room.name.clone(), passwd: room.passwd.clone(), cs: cs };
             rooms.insert(room.id, r.clone());
@@ -332,6 +321,7 @@ impl Process {
                 passwd: r.passwd.clone(),
             };
             write(&mut self.stm, &serde_json::to_vec(&rom)?).await?;
+            write(&mut self.stm, &serde_json::to_vec(&Vec::<ClientInfo>::new()).unwrap()).await?;
             break;
         }
         // 记录房间
@@ -342,15 +332,16 @@ impl Process {
 
 #[derive(Clone)]
 struct Client {
-    user_info: BaseUserInfo,
+    id: u32,
+    name: String,
     addr: SocketAddr,
-    tx: mpsc::Sender<ClientInfo>,
 }
 
 impl Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client").field("user_info", &self.user_info)
-            .field("addr", &self.addr).finish()
+        f.debug_struct("Client").field("id", &self.id)
+            .field("name", &self.name).field("addr", &self.addr)
+            .finish()
     }
 }
 
