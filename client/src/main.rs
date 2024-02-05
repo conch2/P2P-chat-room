@@ -24,10 +24,14 @@ async fn main() {
     };
     let (listener, mut server_stream) = {
         let sock = TcpSocket::new_v4().unwrap();
+        #[cfg(target_family = "unix")]
+        {sock.set_reuseport(true).unwrap();}
         sock.set_reuseaddr(true).unwrap();
         println!("local address: {}", loc_addr);
         sock.bind(loc_addr).unwrap();
         let server_sock = TcpSocket::new_v4().unwrap();
+        #[cfg(target_family = "unix")]
+        {server_sock.set_reuseport(true).unwrap();}
         server_sock.set_reuseaddr(true).unwrap();
         server_sock.bind(loc_addr).unwrap();
         (sock.listen(1024).unwrap(), server_sock.connect(server_addr.parse().unwrap()).await.unwrap())
@@ -71,6 +75,8 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
         set.spawn(async move {
             let mut stm = {
                 let sock = TcpSocket::new_v4().unwrap();
+                #[cfg(target_family = "unix")]
+                {sock.set_reuseport(true).unwrap();}
                 sock.set_reuseaddr(true).unwrap();
                 sock.bind(addr.clone()).unwrap();
                 if let Ok(stm) = sock.connect(ci.addr.clone()).await {
@@ -133,6 +139,8 @@ async fn server_handle(mut server_stream: TcpStream, user_info: User,
                         addr: ci.addr.clone()
                     };
                     let sock = TcpSocket::new_v4().unwrap();
+                    #[cfg(target_family = "unix")]
+                    {sock.set_reuseport(true).unwrap();}
                     sock.set_reuseaddr(true).unwrap();
                     if let Err(e) = sock.bind(addr.clone()) {
                         println!("Fail to bind {} {}", &addr, e);
