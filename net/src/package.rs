@@ -7,7 +7,14 @@ use tokio::{
 
 pub async fn read(stm: &mut TcpStream) -> Result<Vec<u8>> {
     let mut len_buf: [u8; 4] = [0; 4];
-    stm.read(&mut len_buf).await?;
+    match stm.read(&mut len_buf).await {
+        Ok(siz) => {
+            if siz != 4 {
+                return Err(ErrorKind::Other.into());
+            }
+        },
+        Err(e) => { return Err(e); },
+    }
     let len = u32::from_be_bytes(len_buf);
     let mut data: Vec<u8> = Vec::with_capacity(len as usize);
     unsafe { data.set_len(len as usize); }
@@ -47,11 +54,11 @@ impl TryRead {
         }
     }
 
-    pub fn poll(&mut self, stm: &mut TcpStream) -> Result<()> {
+    pub fn poll(&mut self, stm: &mut TcpStream) -> Result<u32> {
         if let TryReadBuf::BUF((len_buf, buf_len)) = self.len_buf.borrow_mut() {
             let rlen = stm.try_read(&mut len_buf[*buf_len..])?;
             if rlen == 0 {
-                return Err(io::ErrorKind::WouldBlock.into());
+                return Ok(0);
             }
             *buf_len += rlen;
             if *buf_len < 4 {
@@ -63,7 +70,7 @@ impl TryRead {
         }
         let pkg_len = if let TryReadBuf::LEN(l) = self.len_buf { l } else { 0 };
         if self.len_buf.len().unwrap() as usize == self.pkg.len() {
-            return Ok(());
+            return Ok(0);
         }
         let old_len = self.pkg.len();
         unsafe { self.pkg.set_len(pkg_len as usize) }
@@ -78,7 +85,7 @@ impl TryRead {
         };
         unsafe { self.pkg.set_len(rlen + old_len) }
         if self.pkg.len() == pkg_len as usize {
-            return Ok(());
+            return Ok(rlen as u32);
         }
         return Err(io::ErrorKind::WouldBlock.into());
     }

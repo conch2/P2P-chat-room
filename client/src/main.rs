@@ -1,9 +1,11 @@
-use std::{io::Write, net::SocketAddr, sync::Arc};
+use std::{env, io::Write, net::{SocketAddr, SocketAddrV4, Ipv4Addr}, sync::Arc, time::Duration};
 use net::{self, BaseUserInfo, Room, ToPackage, TryRead, User, ClientInfo};
+use rand::Rng;
 use tokio::{
     io::{stdin, AsyncBufReadExt, BufReader, Result},
     net::{TcpListener, TcpSocket, TcpStream},
     sync::{mpsc::{self, Sender, Receiver}, watch, Mutex},
+    time::sleep
 };
 
 const SERVER_ADDR: &str = "127.0.0.1:5566";
@@ -11,10 +13,24 @@ const SERVER_ADDR: &str = "127.0.0.1:5566";
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    let mut server_stream = {
+    let mut server_addr: String = SERVER_ADDR.into();
+    if env::args().len() > 1 {
+        server_addr = env::args().nth(1).unwrap();
+    }
+    let loc_addr = {
+        let mut rng = rand::thread_rng();
+        let port = rng.gen_range(4000..9000);
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), port))
+    };
+    let (listener, mut server_stream) = {
+        let sock = TcpSocket::new_v4().unwrap();
+        sock.set_reuseaddr(true).unwrap();
+        println!("local address: {}", loc_addr);
+        sock.bind(loc_addr).unwrap();
         let server_sock = TcpSocket::new_v4().unwrap();
         server_sock.set_reuseaddr(true).unwrap();
-        server_sock.connect(SERVER_ADDR.parse().unwrap()).await.unwrap()
+        server_sock.bind(loc_addr).unwrap();
+        (sock.listen(1024).unwrap(), server_sock.connect(server_addr.parse().unwrap()).await.unwrap())
     };
     println!("已连接服务器。");
     // 登录
@@ -24,16 +40,6 @@ async fn main() {
     println!("进入房间：{:?}", &room);
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>(64);
     let (cin_tx, cin_rx) = watch::channel(String::new());
-    let listener = {
-        let sock = TcpSocket::new_v4().unwrap();
-        sock.set_reuseaddr(true).unwrap();
-        let mut loc_addr = server_stream.local_addr().unwrap();
-        println!("server from local addr: {}", loc_addr);
-        loc_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
-        println!("listen addr: {}", loc_addr);
-        sock.bind(loc_addr).unwrap();
-        sock.listen(1024).unwrap()
-    };
 
     init_room(&mut server_stream, &user_info, cin_rx.clone(), msg_tx.clone()).await;
 
@@ -55,6 +61,8 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
 ) {
     let clients: Vec<ClientInfo> = serde_json::from_slice(&net::read(&mut server_stream).await.unwrap()).unwrap();
     println!("房间中共有{}个人", clients.len());
+    if clients.len() > 0 { println!("开始建立连接..."); }
+    let addr = server_stream.local_addr().unwrap();
     let mut set = tokio::task::JoinSet::new();
     for ci in clients {
         let user_info = user_info.clone();
@@ -62,7 +70,10 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
         let msg_tx = msg_tx.clone();
         set.spawn(async move {
             let mut stm = {
-                if let Ok(stm) = TcpStream::connect(ci.addr.clone()).await {
+                let sock = TcpSocket::new_v4().unwrap();
+                sock.set_reuseaddr(true).unwrap();
+                sock.bind(addr.clone()).unwrap();
+                if let Ok(stm) = sock.connect(ci.addr.clone()).await {
                     stm
                 } else {
                     println!("连接{:?}失败", &ci);
@@ -101,27 +112,48 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
 async fn server_handle(mut server_stream: TcpStream, user_info: User,
         msg_tx: Sender<Msg>, clients: Arc<Mutex<Vec<ClientInfo>>>, cin_rx: watch::Receiver<String>
 ) {
+    let addr = server_stream.local_addr().unwrap();
     loop {
-        if let Ok(ci) = serde_json::from_slice::<net::ClientInfo>(&{
-            if let Ok(pkg) = net::read(&mut server_stream).await { pkg }
-            else { continue; }
-        }) {
-            let theci = ClientInfo {
-                id: ci.id,
-                name: ci.name,
-                addr: ci.addr.clone()
-            };
-            let mut sock = TcpStream::connect(ci.addr.clone()).await.unwrap();
-            if let Err(e) = swap_info(&user_info, &mut sock, ci.addr.clone()).await {
-                println!("无法获取客户端信息{:?}: {}", theci, e.to_string());
-            }
-            let prcs = Process::new(&theci, sock, msg_tx.clone(), cin_rx.clone());
-            tokio::spawn(prcs.poll());
-            println!("Connect: {:?}", &theci);
-            clients.lock().await.push(theci);
-        } else {
-            println!("Unknown Pakage");
-        }
+        tokio::select! {
+            _ = sleep(Duration::from_millis(5000)) => {
+                net::write(&mut server_stream, "".as_bytes()).await.unwrap();
+            },
+            _ = server_stream.readable() => {
+                let pkg = {
+                    if let Ok(pkg) = net::read(&mut server_stream).await { pkg }
+                    else { break; }
+                };
+                if pkg.len() == 0 {
+                    continue;
+                }
+                if let Ok(ci) = serde_json::from_slice::<net::ClientInfo>(&pkg) {
+                    let theci = ClientInfo {
+                        id: ci.id,
+                        name: ci.name,
+                        addr: ci.addr.clone()
+                    };
+                    let sock = TcpSocket::new_v4().unwrap();
+                    sock.set_reuseaddr(true).unwrap();
+                    if let Err(e) = sock.bind(addr.clone()) {
+                        println!("Fail to bind {} {}", &addr, e);
+                        continue;
+                    };
+                    let mut sock = {
+                        if let Ok(s) = sock.connect(ci.addr.clone()).await { s }
+                        else { continue; }
+                    };
+                    if let Err(e) = swap_info(&user_info, &mut sock, ci.addr.clone()).await {
+                        println!("无法获取客户端信息{:?}: {}", theci, e.to_string());
+                    }
+                    let prcs = Process::new(&theci, sock, msg_tx.clone(), cin_rx.clone());
+                    tokio::spawn(prcs.poll());
+                    println!("Connect: {:?}", &theci);
+                    clients.lock().await.push(theci);
+                } else {
+                    println!("Unknown Pakage {:?}", &pkg);
+                }
+            },
+        };
     }
 }
 
@@ -224,7 +256,10 @@ impl Process {
                     }
                     loop {
                         match reader.poll(&mut self.sock) {
-                            Ok(_) => {
+                            Ok(rlen) => {
+                                if rlen == 0 {
+                                    break 'a;
+                                }
                                 let pkg = reader.package();
                                 let msg = String::from_utf8(pkg);
                                 if let Ok(msg) = msg {
