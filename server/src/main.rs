@@ -1,19 +1,36 @@
+use log::{error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
-use std::env;
-use std::fmt::Debug;
-use std::process::exit;
+use std::{env, process::exit, io::Write};
+use std::{fmt::Debug, time::Duration};
 use std::{net::SocketAddr, str, sync::Arc};
 use net::*;
-use tokio::sync::*;
-use tokio::io::*;
-use tokio::time::sleep;
-use std::time::Duration;
+use tokio::{sync::*, io::*, time::sleep};
 
 const LISTEN_ADDR: &str = "0.0.0.0:5566";
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::new()
+        .format(|buf, record| {
+            let color = match record.level() {
+                log::Level::Trace => "",
+                log::Level::Debug => "\x1B[32m",
+                log::Level::Info => "\x1B[32m",
+                log::Level::Warn => "\x1B[35m",
+                log::Level::Error => "\x1B[1;31m",
+            };
+            writeln!(buf,
+                "{}[{} {}] {}\x1B[0m",
+                color,
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .filter(None, log::LevelFilter::Debug)
+        .target(env_logger::Target::Stdout)
+        .init();
     // 默认端口5566
     let mut addr: String = LISTEN_ADDR.into();
     if env::args().len() > 1 {
@@ -41,7 +58,7 @@ impl Server {
                 if let Ok(listener) = TcpListener::bind(addr).await {
                     listener
                 } else {
-                    println!("请检查该地址是否正确：{}", addr);
+                    error!("请检查该地址是否正确：{}", addr);
                     exit(1);
                 }
             },
@@ -51,7 +68,7 @@ impl Server {
     }
 
     async fn run(self) {
-        println!("server run in {}", self.addr);
+        info!("server run in {}", self.addr);
 
         let t1 = tokio::spawn(Self::poll_cmd(self.rooms.clone(), self.users.clone()));
         let t2 = tokio::spawn(Self::accept(self.listener, self.rooms.clone(), self.users.clone()));
@@ -74,6 +91,10 @@ impl Server {
             let mut reader = BufReader::new(stdin());
             let mut buf = String::new();
             reader.read_line(&mut buf).await.unwrap();
+            if buf.len() == 0 {
+                warn!("stdin has been closed");
+                break;
+            }
             if String::from(buf.trim()).to_uppercase() == "echo rooms".to_uppercase() {
                 let lock = rooms.lock().await;
                 println!("{:#?}", &lock as &AllRoomInfo);
@@ -108,14 +129,14 @@ impl CertificationCenter {
             name: user.name.clone(),
         };
         write(&mut stm, &serde_json::to_vec(&base_info).unwrap()).await.unwrap();
-        println!("{}: {:?}", &addr, &user);
+        info!("{}: {:?}", &addr, &user);
         let uid = user.id;
         let mut prcs = Process::new(user, stm, addr, rooms.clone());
         prcs.poll().await.ok();
         {
             let mut users = users.lock().await;
             users.remove(uid);
-            println!("{}: Quit {:?}", prcs.addr, prcs.user);
+            info!("{}: Quit {:?}", prcs.addr, prcs.user);
         } {
             // 退出
             let mut lock = rooms.lock().await;
@@ -132,7 +153,7 @@ impl CertificationCenter {
                 // 如果房间为空了就删除房间
                 if len == 0 {
                     let rom = lock.remove(*rid);
-                    println!("{:?} was destroyed", rom);
+                    info!("{:?} was destroyed", rom);
                 }
             }
         }
@@ -238,7 +259,7 @@ impl Process {
     async fn poll(&mut self) -> Result<()> {
         let (tx, mut rx) = mpsc::channel::<ClientInfo>(64);
         // 接收客户端传过来的房间信息
-        let _ = loop {
+        let room = loop {
             match self.inst_room(tx.clone()).await {
                 Ok(r) => break r,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -247,6 +268,7 @@ impl Process {
                 Err(e) => { return Err(e); }
             }
         };
+        info!("{} join {}", self.user.name, room.name);
         let mut reader = TryRead::new();
         loop {
             tokio::select! {
@@ -374,7 +396,7 @@ impl Process {
             let r = RoomFull { id: room.id, name: room.name.clone(), passwd: room.passwd.clone(), cs: cs };
             rooms.insert(room.id, r.clone());
             rooms_by_name.insert(room.name.clone(), room.id);
-            println!("New: {:?}", room);
+            info!("New: {:?}", room);
             write(&mut self.stm, "OK".as_bytes()).await?;
             let rom = Room {
                 id: r.id,

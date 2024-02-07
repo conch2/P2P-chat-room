@@ -1,4 +1,6 @@
 use std::{env, io::Write, net::{SocketAddr, SocketAddrV4, Ipv4Addr}, sync::Arc, time::Duration};
+use env_logger::Builder;
+use log::{error, info, warn, LevelFilter};
 use net::{self, BaseUserInfo, Room, ToPackage, TryRead, User, ClientInfo};
 use rand::Rng;
 use tokio::{
@@ -12,7 +14,26 @@ const SERVER_ADDR: &str = "127.0.0.1:5566";
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    Builder::new()
+        .format(|buf, record| {
+            let color = match record.level() {
+                log::Level::Trace => "",
+                log::Level::Debug => "\x1B[32m",
+                log::Level::Info => "\x1B[32m",
+                log::Level::Warn => "\x1B[35m",
+                log::Level::Error => "\x1B[1;31m",
+            };
+            writeln!(buf,
+                "{}[{} {}] {}\x1B[0m",
+                color,
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .filter(None, LevelFilter::Debug)
+        .target(env_logger::Target::Stdout)
+        .init();
     let mut server_addr: String = SERVER_ADDR.into();
     if env::args().len() > 1 {
         server_addr = env::args().nth(1).unwrap();
@@ -27,7 +48,7 @@ async fn main() {
         #[cfg(target_family = "unix")]
         {sock.set_reuseport(true).unwrap();}
         sock.set_reuseaddr(true).unwrap();
-        println!("local address: {}", loc_addr);
+        info!("local address: {}", loc_addr);
         sock.bind(loc_addr).unwrap();
         let server_sock = TcpSocket::new_v4().unwrap();
         #[cfg(target_family = "unix")]
@@ -36,12 +57,12 @@ async fn main() {
         server_sock.bind(loc_addr).unwrap();
         (sock.listen(1024).unwrap(), server_sock.connect(server_addr.parse().unwrap()).await.unwrap())
     };
-    println!("已连接服务器。");
+    info!("已连接服务器。");
     // 登录
     let user_info = get_user_info(&mut server_stream).await;
     // 发送房间信息
     let room = get_room_info(&mut server_stream).await;
-    println!("进入房间：{:?}", &room);
+    info!("进入房间：{:?}", &room);
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>(64);
     let (cin_tx, cin_rx) = watch::channel(String::new());
 
@@ -64,8 +85,8 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
     cin_rx: watch::Receiver<String>, msg_tx: Sender<Msg>
 ) {
     let clients: Vec<ClientInfo> = serde_json::from_slice(&net::read(&mut server_stream).await.unwrap()).unwrap();
-    println!("房间中共有{}个人", clients.len());
-    if clients.len() > 0 { println!("开始建立连接..."); }
+    info!("房间中共有{}个人", clients.len());
+    if clients.len() > 0 { info!("开始建立连接..."); }
     let addr = server_stream.local_addr().unwrap();
     let mut set = tokio::task::JoinSet::new();
     for ci in clients {
@@ -82,7 +103,7 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
                 if let Ok(stm) = sock.connect(ci.addr.clone()).await {
                     stm
                 } else {
-                    println!("连接{:?}失败", &ci);
+                    warn!("连接{:?}失败", &ci);
                     return Err(ci);
                 }
             };
@@ -91,11 +112,11 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
                     ci
                 }
                 else {
-                    println!("连接{:?}失败，无法验证身法", &ci);
+                    warn!("连接{:?}失败，无法验证身法", &ci);
                     return Err(ci);
                 }
             };
-            println!("Connect: {:?}", &other);
+            info!("Connect: {:?}", &other);
             tokio::spawn(Process::new(
                 &other, stm, msg_tx, cin_rx
             ).poll());
@@ -112,7 +133,7 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
         }
     }
     net::write(&mut server_stream, &serde_json::to_vec(&e_cis).unwrap()).await.unwrap();
-    println!("OK.");
+    info!("OK.");
 }
 
 async fn server_handle(mut server_stream: TcpStream, user_info: User,
@@ -143,7 +164,7 @@ async fn server_handle(mut server_stream: TcpStream, user_info: User,
                     {sock.set_reuseport(true).unwrap();}
                     sock.set_reuseaddr(true).unwrap();
                     if let Err(e) = sock.bind(addr.clone()) {
-                        println!("Fail to bind {} {}", &addr, e);
+                        error!("Fail to bind {} {}", &addr, e);
                         continue;
                     };
                     let mut sock = {
@@ -151,14 +172,14 @@ async fn server_handle(mut server_stream: TcpStream, user_info: User,
                         else { continue; }
                     };
                     if let Err(e) = swap_info(&user_info, &mut sock, ci.addr.clone()).await {
-                        println!("无法获取客户端信息{:?}: {}", theci, e.to_string());
+                        warn!("无法获取客户端信息{:?}: {}", theci, e.to_string());
                     }
                     let prcs = Process::new(&theci, sock, msg_tx.clone(), cin_rx.clone());
                     tokio::spawn(prcs.poll());
-                    println!("Connect: {:?}", &theci);
+                    info!("Connect: {:?}", &theci);
                     clients.lock().await.push(theci);
                 } else {
-                    println!("Unknown Pakage {:?}", &pkg);
+                    info!("Unknown Pakage {:?}", &pkg);
                 }
             },
         };
@@ -199,7 +220,7 @@ async fn accecpt_handle(listener: TcpListener, user_info: User,
             }
             else { continue; }
         };
-        println!("Accept: {:?}", &other);
+        info!("Accept: {:?}", &other);
         tokio::spawn(Process::new(
             &other, stm, msg_tx.clone(), cin_rx.clone()
         ).poll());
@@ -213,7 +234,7 @@ async fn msg_handle(mut msg_rx: Receiver<Msg>) {
             panic!("Fail to recv message");
         }
         let msg = res.unwrap();
-        println!("{}: {}", &msg.from.name, &msg.msg);
+        println!("[{}] {}: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), &msg.from.name, &msg.msg);
     }
 }
 
@@ -221,7 +242,9 @@ async fn cin_handle(cin_tx: watch::Sender<String>) {
     loop {
         let mut reader = BufReader::new(stdin());
         let mut buf = String::new();
-        reader.read_line(&mut buf).await.unwrap();
+        if let Err(e) = reader.read_line(&mut buf).await {
+            warn!("{}", e);
+        }
         buf = buf.trim().to_string();
         if buf.len() != 0 {
             cin_tx.send(buf.clone()).unwrap();
@@ -296,7 +319,7 @@ impl Process {
                 },
             };
         }
-        println!("Disconnect: {:?}", bui);
+        info!("Disconnect: {:?}", bui);
     }
 }
 
@@ -322,7 +345,7 @@ async fn get_user_info(mut serv: &mut TcpStream) -> User {
             u.id = base_info.id;
             break u;
         }
-        println!("请输入正确的用户！");
+        warn!("请输入正确的用户！");
     }
 }
 
@@ -337,6 +360,7 @@ async fn get_room_info(serv: &mut TcpStream) -> Room {
             rom = net::read(serv).await.unwrap().into();
             return rom;
         }
+        warn!("请确认房间信息是否正确！");
     }
 }
 
