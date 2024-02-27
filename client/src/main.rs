@@ -22,7 +22,7 @@ async fn main() {
     {   extern "C" {
             fn system(cmd: *const std::ffi::c_char) -> std::ffi::c_int;
         }
-        unsafe { system("chcp 65001".as_ptr() as *const std::ffi::c_char); }
+        unsafe { system("chcp 65001\0".as_ptr() as *const std::ffi::c_char); }
     }
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>(128);
     let (cin_tx, mut cin_rx) = watch::channel(String::new());
@@ -66,7 +66,7 @@ async fn main() {
         match server_sock.connect(server_addr.parse().unwrap()).await {
             Ok(sock) => { sock },
             Err(e) => {
-                error!("无法连接到服务器。{}", e);
+                eprintln!("无法连接到服务器。{}", e);
                 return;
             },
         }
@@ -147,6 +147,7 @@ async fn poll_user_input(cin_tx: watch::Sender<String>, msg_tx: mpsc::Sender<Msg
 async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
     cin_rx: watch::Receiver<String>, msg_tx: Sender<Msg>
 ) {
+    // 接收服务端发送过来的所有房间内的peer
     let clients: Vec<ClientInfo> = serde_json::from_slice(&net::read(&mut server_stream).await.unwrap()).unwrap();
     info!("房间中共有{}个人", clients.len());
     if clients.len() > 0 { info!("开始建立连接..."); }
@@ -210,8 +211,14 @@ async fn server_handle(mut server_stream: TcpStream, user_info: User,
             },
             _ = server_stream.readable() => {
                 let pkg = {
-                    if let Ok(pkg) = net::read(&mut server_stream).await { pkg }
-                    else { break; }
+                    match net::read(&mut server_stream).await {
+                        Ok(pkg) => pkg,
+                        Err(e) => {
+                            match e {
+                                _ => { break; }
+                            }
+                        }
+                    }
                 };
                 if pkg.len() == 0 {
                     continue;
@@ -377,15 +384,11 @@ impl Process {
                                 }
                             },
                             Err(e) => {
-                                match e {
-                                    net::ErrorType::None | net::ErrorType::NotPakage(_) | net::ErrorType::MissingHead(_) => { break; },
-                                    net::ErrorType::IO(e) => {
-                                        if let std::io::ErrorKind::WouldBlock = e.kind() { break; }
-                                        else {
-                                            break 'a;
-                                        }
-                                    },
-                                    e => { warn!("{:?}", e); break 'a; }
+                                if let Some(e) = e.can_continue() {
+                                    warn!("{:?}", e);
+                                    break 'a;
+                                } else {
+                                    break;
                                 }
                             },
                         }

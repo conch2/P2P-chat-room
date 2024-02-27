@@ -18,6 +18,31 @@ pub enum ErrorType {
     None,
 }
 
+impl ErrorType {
+    pub fn can_continue(self) -> Option<ErrorType> {
+        match self {
+            Self::None | Self::NotPakage(_) => {
+                None
+            },
+            Self::MissingHead(vec) => {
+                if vec.len() == 0 {
+                    Some(Self::MissingHead(vec))
+                } else {
+                    None
+                }
+            },
+            Self::IO(e) => {
+                if let std::io::ErrorKind::WouldBlock = e.kind() {
+                    None
+                } else {
+                    Some(Self::IO(e))
+                }
+            },
+            e => { Some(e) }
+        }
+    }
+}
+
 fn verify_head(buf: &[u8; 8]) -> Option<u32> {
     let mut u32_byte_buf: [u8; 4] = [0u8; 4];
     u32_byte_buf.copy_from_slice(&buf[..4]);

@@ -296,20 +296,11 @@ impl Process {
                             self.parse_pakage(&reader.package()).await?;
                         }
                         Err(e) => {
-                            match e {
-                                net::ErrorType::None | net::ErrorType::NotPakage(_) => { },
-                                net::ErrorType::MissingHead(vec) => {
-                                    if vec.len() == 0 {
-                                        break;
-                                    }
-                                },
-                                net::ErrorType::IO(e) => {
-                                    if let std::io::ErrorKind::WouldBlock = e.kind() { }
-                                    else {
-                                        break;
-                                    }
-                                },
-                                e => { warn!("{:?}", e); break; }
+                            if let Some(e) = e.can_continue() {
+                                warn!("{:?}", e);
+                                break;
+                            } else {
+                                continue;
                             }
                         },
                     }
