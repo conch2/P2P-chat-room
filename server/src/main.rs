@@ -1,4 +1,4 @@
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
 use std::{env, process::exit, io::Write};
@@ -80,6 +80,7 @@ impl Server {
     async fn accept(listener: TcpListener,  rooms: Arc<Mutex<AllRoomInfo>>, users: Arc<Mutex<AllUserInfo>>) {
         loop {
             let (stm, addr) = listener.accept().await.unwrap();
+            debug!("New peer: {}", addr);
             // 创建任务处理
             tokio::spawn(CertificationCenter::poll(stm, addr, rooms.clone(), users.clone()));
         }
@@ -87,8 +88,8 @@ impl Server {
 
     /// 处理标准输入
     async fn poll_cmd(rooms: Arc<Mutex<AllRoomInfo>>, users: Arc<Mutex<AllUserInfo>>) {
+        let mut reader = BufReader::new(stdin());
         loop {
-            let mut reader = BufReader::new(stdin());
             let mut buf = String::new();
             reader.read_line(&mut buf).await.unwrap();
             if buf.len() == 0 {
@@ -117,7 +118,13 @@ impl CertificationCenter {
     async fn poll(mut stm: TcpStream, addr: SocketAddr,
             rooms: Arc<Mutex<AllRoomInfo>>, users: Arc<Mutex<AllUserInfo>>
         ) {
-        let mut user = Self::wait_login(&mut stm, users.clone()).await.unwrap();
+        let mut user = match Self::wait_login(&mut stm, users.clone()).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("客户端[{}]用户登录失败 {}", addr, e);
+                return ;
+            }
+        };
         {
             let mut users = users.lock().await;
             users.insert(&mut user);
@@ -148,6 +155,8 @@ impl CertificationCenter {
                 let len: usize = {
                     let rom = lock.by_id.get_mut(rid).unwrap();
                     rom.cs.remove(&prcs.user.id);
+                    info!("User[id: {}, name: \"{}\"] remove from Room[id: {}, name: \"{}\"]",
+                            base_info.id, base_info.name, rom.id, rom.name);
                     rom.cs.len()
                 };
                 // 如果房间为空了就删除房间
@@ -163,7 +172,21 @@ impl CertificationCenter {
     /// 成功返回用户信息
     async fn wait_login(mut stm: &mut TcpStream, users: Arc<Mutex<AllUserInfo>>) -> Result<User> {
         loop {
-            let pack = read(stm).await?;
+            let pack = match read(stm).await {
+                Ok(pkg) => { pkg },
+                Err(e) => {
+                    match e {
+                        ErrorType::IO(e) => { return Err(e); },
+                        ErrorType::MissingHead(head) => {
+                            if head.len() == 0 {
+                                break Err(std::io::ErrorKind::Other.into());
+                            }
+                            continue;
+                        },
+                        e => { debug!("{:?}", e); continue; },
+                    }
+                },
+            };
             if pack.len() == 0 {
                 continue;
             }
@@ -212,10 +235,10 @@ impl AllRoomInfo {
 
 #[derive(Debug, Default)]
 struct AllUserInfo {
-    by_id: HashMap<u32, User>,
-    by_name: HashMap<String, u32>,
+    by_id: HashMap<ID, User>,
+    by_name: HashMap<String, ID>,
     // 当一个房间被删除时会将房间ID存入，以便取用
-    unuse_id: Vec<u32>,
+    unuse_id: Vec<ID>,
 }
 
 impl AllUserInfo {
@@ -223,7 +246,7 @@ impl AllUserInfo {
         if self.unuse_id.len() != 0 {
             u.id = self.unuse_id.pop().unwrap();
         } else {
-            u.id = self.by_id.len() as u32;
+            u.id = self.by_id.len() as ID;
             while let Some(_) = self.by_id.get(&u.id) {
                 u.id += 1;
             }
@@ -232,7 +255,7 @@ impl AllUserInfo {
         self.by_id.insert(u.id, u.clone());
     }
 
-    fn remove(&mut self, id: u32) {
+    fn remove(&mut self, id: ID) {
         let u = self.by_id.remove(&id).unwrap();
         self.by_name.remove(&u.name);
         self.unuse_id.push(id);
@@ -245,30 +268,22 @@ struct Process {
     stm: TcpStream,
     addr: SocketAddr,
     all_rooms: Arc<Mutex<AllRoomInfo>>,
-    room: Vec<u32>,
+    room: Vec<ID>,
+    tx: mpsc::Sender<ClientInfo>,
+    rx: mpsc::Receiver<ClientInfo>,
 }
 
 impl Process {
     fn new(user: User, stm: TcpStream, addr: SocketAddr, rooms: Arc<Mutex<AllRoomInfo>>) -> Self {
+        let (tx, rx) = mpsc::channel::<ClientInfo>(64);
         Process {
             user, stm, addr, all_rooms: rooms,
-            room: Vec::new()
+            room: Vec::new(),
+            tx, rx,
         }
     }
 
     async fn poll(&mut self) -> Result<()> {
-        let (tx, mut rx) = mpsc::channel::<ClientInfo>(64);
-        // 接收客户端传过来的房间信息
-        let room = loop {
-            match self.inst_room(tx.clone()).await {
-                Ok(r) => break r,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    write(&mut self.stm, "Fail to join room".as_bytes()).await?;
-                }
-                Err(e) => { return Err(e); }
-            }
-        };
-        info!("{} join {}", self.user.name, room.name);
         let mut reader = TryRead::new();
         loop {
             tokio::select! {
@@ -277,15 +292,29 @@ impl Process {
                         break;
                     }
                     match reader.poll(&mut self.stm) {
-                        Ok(rlen) => {
-                            if rlen == 0 { break; }
-                            reader.clear();
+                        Ok(_) => {
+                            self.parse_pakage(&reader.package()).await?;
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { }
-                        Err(_) => { break; }
+                        Err(e) => {
+                            match e {
+                                net::ErrorType::None | net::ErrorType::NotPakage(_) => { },
+                                net::ErrorType::MissingHead(vec) => {
+                                    if vec.len() == 0 {
+                                        break;
+                                    }
+                                },
+                                net::ErrorType::IO(e) => {
+                                    if let std::io::ErrorKind::WouldBlock = e.kind() { }
+                                    else {
+                                        break;
+                                    }
+                                },
+                                e => { warn!("{:?}", e); break; }
+                            }
+                        },
                     }
                 },
-                c = rx.recv() => {
+                c = self.rx.recv() => {
                     if let Some(c) = c {
                         write(&mut self.stm, &serde_json::to_vec(&c)?).await?;
                     }
@@ -301,15 +330,7 @@ impl Process {
         Ok(())
     }
 
-    async fn inst_room(&mut self, tx: mpsc::Sender<ClientInfo>) -> Result<Room> {
-        let mut room: Room = {
-            let pkg = read(&mut self.stm).await?;
-            if let Ok(rom) = serde_json::from_slice(pkg.as_slice()) {
-                rom
-            } else {
-                return Err(std::io::ErrorKind::WouldBlock.into());
-            }
-        };
+    async fn inst_room(&mut self, mut room: Room) -> Result<Room> {
         let mut lock = self.all_rooms.lock().await;
         let AllRoomInfo {
             by_id: rooms,
@@ -332,7 +353,7 @@ impl Process {
                             if unuse_id.len() != 0 {
                                 room.id = unuse_id.pop().unwrap();
                             } else {
-                                room.id = rooms.len() as u32;
+                                room.id = rooms.len() as ID;
                                 while let Some(_) = rooms.get(&room.id) {
                                     room.id += 1;
                                 }
@@ -365,7 +386,7 @@ impl Process {
                         id: self.user.id,
                         name: self.user.name.clone(),
                         addr: self.addr.clone(),
-                        tx: tx.clone(),
+                        tx: self.tx.clone(),
                     });
                     // 放开锁
                     drop(lock);
@@ -381,7 +402,7 @@ impl Process {
                         tx.send(cr_info.clone()).await.ok();
                     }
                 } else {
-                    return Err(std::io::ErrorKind::WouldBlock.into());
+                    return Err(std::io::ErrorKind::Other.into());
                 }
                 break 'a;
             }
@@ -391,7 +412,7 @@ impl Process {
                 id: self.user.id,
                 name: self.user.name.clone(),
                 addr: self.addr.clone(),
-                tx: tx.clone(),
+                tx: self.tx.clone(),
             });
             let r = RoomFull { id: room.id, name: room.name.clone(), passwd: room.passwd.clone(), cs: cs };
             rooms.insert(room.id, r.clone());
@@ -411,11 +432,27 @@ impl Process {
         self.room.push(room.id);
         Ok(room)
     }
+
+    // 处理数据包
+    async fn parse_pakage(&mut self, pkg: &[u8]) -> Result<()> {
+        if let Ok(room) = serde_json::from_slice::<net::Room>(&pkg) {
+            // 接收客户端传过来的房间信息
+            let room = match self.inst_room(room).await {
+                Ok(rom) => { rom },
+                Err(_) => {
+                    write(&mut self.stm, "Fail to join room".as_bytes()).await?;
+                    return Ok(());
+                }
+            };
+            info!("\"{}\" join \"{}\"", self.user.name, room.name);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 struct Client {
-    id: u32,
+    id: ID,
     name: String,
     addr: SocketAddr,
     tx: mpsc::Sender<ClientInfo>,
@@ -431,8 +468,8 @@ impl Debug for Client {
 
 #[derive(Debug, Clone)]
 pub struct RoomFull {
-    pub id: u32,
+    pub id: ID,
     name: String,
     passwd: String,
-    cs: HashMap<u32, Client>,
+    cs: HashMap<ID, Client>,
 }

@@ -1,6 +1,8 @@
 pub mod package;
 pub mod room;
 
+pub type ID = u32;
+
 pub use package::*;
 pub use room::*;
 use std::net::SocketAddr;
@@ -8,7 +10,7 @@ use std::net::SocketAddr;
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Debug, Clone)]
 pub struct BaseUserInfo {
-    pub id: u32,
+    pub id: ID,
     pub name: String,
 }
 
@@ -16,7 +18,7 @@ pub struct BaseUserInfo {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
-    pub id: u32,
+    pub id: ID,
     pub name: String,
     pub addr: SocketAddr,
 }
@@ -28,7 +30,7 @@ pub trait ToPackage {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Debug, Default, Clone)]
 pub struct User {
-    pub id: u32,
+    pub id: ID,
     pub name: String,
     pub passwd: String,
 }
