@@ -1,6 +1,6 @@
 use std::{
     env, io::Write, mem::size_of, net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    process::exit, sync::Arc, time::Duration
+    sync::Arc, time::Duration
 };
 use env_logger::Builder;
 use log::{debug, error, info, warn, LevelFilter};
@@ -27,6 +27,8 @@ async fn main() {
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>(128);
     let (cin_tx, mut cin_rx) = watch::channel(String::new());
     let msg_handle = tokio::spawn(msg_handle(msg_rx));
+    let (log_tx, log_rx) = mpsc::channel::<String>(64);
+    let log_handle = tokio::spawn(log_handle(log_rx, msg_tx.clone()));
     // 设置日志输出格式
     Builder::new()
         .format(|buf, record| {
@@ -46,7 +48,7 @@ async fn main() {
             )
         })
         .filter(None, LevelFilter::Info)
-        .target(env_logger::Target::Pipe(Box::new(MyLogTarget::new(msg_tx.clone()))))
+        .target(env_logger::Target::Pipe(Box::new(MyLogTarget::new(log_tx))))
         .init();
     let mut server_addr: String = DEFAULT_SERVER_ADDR.into();
     if env::args().len() > 1 {
@@ -73,29 +75,63 @@ async fn main() {
     };
     info!("已连接服务器。");
     let msg_tx_clone = msg_tx.clone();
+    let clients: Arc<Mutex<Vec<PeerInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let clients_ = clients.clone();
+    let (shh_tx, ssh_rx) = tokio::sync::oneshot::channel();
+    let (sh_tx, sh_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         // 登录
-        let user_info = login(&mut server_stream, msg_tx.clone(), cin_rx.clone()).await;
+        let user_info = login(&mut server_stream, &msg_tx_clone, &mut cin_rx).await;
         // 在克隆前先将内容清空
         cin_rx.borrow_and_update();
         // 发送房间信息
-        let room = join_room(&mut server_stream, msg_tx.clone(), cin_rx.clone()).await;
+        let room = join_room(&mut server_stream, &msg_tx_clone, &mut cin_rx).await;
         info!("进入房间：{:?}", &room);
 
         cin_rx.borrow_and_update();
-        init_room(&mut server_stream, &user_info, cin_rx.clone(), msg_tx.clone()).await;
+        init_room(&mut server_stream, &user_info, &mut cin_rx, &msg_tx_clone).await;
 
-        let clients: Arc<Mutex<Vec<ClientInfo>>> = Arc::new(Mutex::new(Vec::new()));
-        let _server_handle = tokio::spawn(server_handle(
-            server_stream, user_info.clone(), msg_tx.clone(), clients.clone(), cin_rx.clone()
+        let server_handle = tokio::spawn(handle_server(
+            server_stream, user_info, msg_tx_clone, clients_, cin_rx, sh_rx
         ));
+        shh_tx.send(server_handle).unwrap();
     });
     // 主线程来监控标准输入
-    poll_user_input(cin_tx, msg_tx_clone).await;
+    poll_user_input(&cin_tx, &msg_tx).await;
+    let server_handle = ssh_rx.await.unwrap();
+    info!("正在等待所有任务结束");
+    if let Err(e) = sh_tx.send(true) {
+        error!("Server handle tx Send fail, {}", e);
+    };
+    for _ in 0..50 {
+        let _ = msg_tx.send(Msg::Other(".".to_string())).await;
+        let _ = cin_tx.send('\x03'.to_string());
+        let mut finish = true;
+        if !server_handle.is_finished() {
+            finish = false;
+        } else {
+            for peer in clients.lock().await.iter_mut() {
+                if !peer.handle.is_finished() {
+                    finish = false;
+                    break;
+                }
+            }
+        }
+        if finish {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    for peer in clients.lock().await.iter_mut() {
+        peer.handle.abort();
+    }
+    server_handle.abort();
+    drop(msg_tx);
+    log_handle.abort();
     tokio::try_join!(msg_handle).unwrap();
 }
 
-async fn poll_user_input(cin_tx: watch::Sender<String>, msg_tx: mpsc::Sender<Msg>) {
+async fn poll_user_input(cin_tx: &watch::Sender<String>, msg_tx: &mpsc::Sender<Msg>) {
     let getter = getch::Getch::new();
     let mut str_buf = String::new();
     let mut ch_buf = [0u8; size_of::<char>()];
@@ -107,7 +143,8 @@ async fn poll_user_input(cin_tx: watch::Sender<String>, msg_tx: mpsc::Sender<Msg
         };
         if ch_buf_len == 0 {
             if c == 3 {
-                exit(0);
+                msg_tx.send(Msg::Stdin(c as char)).await.unwrap();
+                break;
             }
         }
         ch_buf[ch_buf_len] = c;
@@ -115,8 +152,7 @@ async fn poll_user_input(cin_tx: watch::Sender<String>, msg_tx: mpsc::Sender<Msg
         if let Ok(c) = std::str::from_utf8(&ch_buf) {
             let c = if let Some(c) = c.chars().nth(0) { c } else { continue; };
             debug!("stdin char: {:?}", c);
-            let tx = msg_tx.clone();
-            tx.send(Msg::Stdin(c)).await.unwrap();
+            msg_tx.send(Msg::Stdin(c)).await.unwrap();
             ch_buf_len = 0;
             ch_buf = [0u8; size_of::<char>()];
             match c {
@@ -145,7 +181,7 @@ async fn poll_user_input(cin_tx: watch::Sender<String>, msg_tx: mpsc::Sender<Msg
 }
 
 async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
-    cin_rx: watch::Receiver<String>, msg_tx: Sender<Msg>
+    cin_rx: &mut watch::Receiver<String>, msg_tx: &Sender<Msg>
 ) {
     // 接收服务端发送过来的所有房间内的peer
     let clients: Vec<ClientInfo> = serde_json::from_slice(&net::read(&mut server_stream).await.unwrap()).unwrap();
@@ -181,7 +217,7 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
                 }
             };
             info!("Connect: {:?}", &other);
-            tokio::spawn(Process::new(
+            tokio::spawn(Peer::new(
                 &other, stm, msg_tx, cin_rx
             ).poll());
             Ok(())
@@ -200,27 +236,43 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
     info!("Connent Room Done.");
 }
 
-async fn server_handle(mut server_stream: TcpStream, user_info: User,
-        msg_tx: Sender<Msg>, clients: Arc<Mutex<Vec<ClientInfo>>>, cin_rx: watch::Receiver<String>
+async fn handle_server(mut server_stream: TcpStream, user_info: User,
+        msg_tx: Sender<Msg>, clients: Arc<Mutex<Vec<PeerInfo>>>, cin_rx: watch::Receiver<String>,
+        mut sh_rx: tokio::sync::oneshot::Receiver<bool>
 ) {
     let addr = server_stream.local_addr().unwrap();
-    loop {
+    let mut reader = TryRead::new();
+    'a: loop {
         tokio::select! {
             _ = sleep(Duration::from_millis(5000)) => {
+                debug!("server 发送心跳包");
                 net::write(&mut server_stream, "".as_bytes()).await.unwrap();
             },
-            _ = server_stream.readable() => {
-                let pkg = {
-                    match net::read(&mut server_stream).await {
-                        Ok(pkg) => pkg,
+            res = server_stream.readable() => {
+                if let Err(e) = res {
+                    error!("Fail to server_stream.readable() {}", e);
+                    break;
+                }
+                debug!("server readable");
+                let pkg = loop {
+                    match reader.poll(&mut server_stream) {
+                        Ok(_) => {
+                            break reader.package();
+                        },
                         Err(e) => {
-                            match e {
-                                _ => { break; }
+                            if let Some(e) = e.can_continue() {
+                                warn!("{:?}", e);
+                                break 'a;
+                            } else {
+                                continue 'a;
                             }
-                        }
+                        },
                     }
                 };
+                debug!("server read pkg done.");
                 if pkg.len() == 0 {
+                    // 心跳包，不用管
+                    debug!("from server 心跳包");
                     continue;
                 }
                 if let Ok(ci) = serde_json::from_slice::<net::ClientInfo>(&pkg) {
@@ -249,16 +301,23 @@ async fn server_handle(mut server_stream: TcpStream, user_info: User,
                     if let Err(e) = swap_info(&user_info, &mut sock, ci.addr.clone()).await {
                         warn!("无法获取客户端信息{:?}: {}", theci, e.to_string());
                     }
-                    let prcs = Process::new(&theci, sock, msg_tx.clone(), cin_rx.clone());
-                    tokio::spawn(prcs.poll());
+                    let prcs = Peer::new(&theci, sock, msg_tx.clone(), cin_rx.clone());
+                    let handle = tokio::spawn(prcs.poll());
                     info!("Connect: {:?}", &theci);
-                    clients.lock().await.push(theci);
+                    clients.lock().await.push(PeerInfo {
+                        ci: theci,
+                        handle
+                    });
                 } else {
                     info!("Unknown Pakage {:?}", &pkg);
                 }
             },
-        };
+            _ = &mut sh_rx => {
+                break;
+            }
+        }
     }
+    info!("Server disconnent.");
 }
 
 /// 交换相互的信息
@@ -296,7 +355,7 @@ async fn msg_handle(mut msg_rx: Receiver<Msg>) {
     loop {
         let res = msg_rx.recv().await;
         if let None = res {
-            panic!("Fail to recv message");
+            break;
         }
         let msg = res.unwrap();
         match msg {
@@ -305,7 +364,8 @@ async fn msg_handle(mut msg_rx: Receiver<Msg>) {
                 print!("{}{}", other_buf, in_buf);
             },
             Msg::UserMsg(msg) => {
-                print!("\x1B[1G\x1B[2K[{}] {}: {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), &msg.0.name, &msg.1);
+                print!("\x1B[1G\x1B[2K[{}] {}: {}\n",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), &msg.0.name, &msg.1);
                 print!("{}{}", other_buf, in_buf);
             },
             Msg::Stdin(ch) => {
@@ -338,6 +398,14 @@ async fn msg_handle(mut msg_rx: Receiver<Msg>) {
     }
 }
 
+async fn log_handle(mut log_rx: Receiver<String>, msg_tx: Sender<Msg>) {
+    loop {
+        if let Some(log) = log_rx.recv().await {
+            msg_tx.send(Msg::Log(log)).await.unwrap();
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Msg {
     UserMsg((BaseUserInfo, String)),
@@ -346,14 +414,19 @@ enum Msg {
     Other(String),
 }
 
-struct Process {
+struct PeerInfo {
+    ci: ClientInfo,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct Peer {
     ci: ClientInfo,
     sock: TcpStream,
     msg_tx: Sender<Msg>,
     cin_rx: watch::Receiver<String>,
 }
 
-impl Process {
+impl Peer {
     fn new(ci: &ClientInfo, sock: TcpStream, msg_tx: Sender<Msg>, cin_rx: watch::Receiver<String>) -> Self {
         Self {
             ci: ClientInfo {
@@ -379,6 +452,7 @@ impl Process {
                                 let pkg = reader.package();
                                 let msg = String::from_utf8(pkg);
                                 if let Ok(msg) = msg {
+                                    // 判断是否为心跳包，是就不用管
                                     if msg.len() == 0 { continue; }
                                     self.msg_tx.send(Msg::UserMsg((bui.clone(), msg))).await.unwrap();
                                 }
@@ -399,6 +473,11 @@ impl Process {
                         break;
                     }
                     let msg = self.cin_rx.borrow_and_update().clone();
+                    if let Some(ch) = msg.chars().nth(0) {
+                        if ch == (3 as char) {
+                            break;
+                        }
+                    }
                     net::write(&mut self.sock, msg.as_bytes()).await.unwrap();
                 },
                 // 每隔一段时间确认一次客户端是否存在
@@ -410,11 +489,12 @@ impl Process {
             };
         }
         info!("Disconnect: {:?}", bui);
+        drop(self.msg_tx);
     }
 }
 
-async fn login(mut serv: &mut TcpStream, msg_tx: mpsc::Sender<Msg>, cin_rx: watch::Receiver<String>) -> User {
-    let mut cin = Cin::new(msg_tx, cin_rx);
+async fn login(mut serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mut watch::Receiver<String>) -> User {
+    let mut cin = Cin {msg_tx, cin_rx};
     loop {
         let mut u = User {
             id: 0,
@@ -441,9 +521,9 @@ async fn login(mut serv: &mut TcpStream, msg_tx: mpsc::Sender<Msg>, cin_rx: watc
     }
 }
 
-async fn join_room(serv: &mut TcpStream, msg_tx: mpsc::Sender<Msg>, cin_rx: watch::Receiver<String>) -> Room {
+async fn join_room(serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mut watch::Receiver<String>) -> Room {
     let mut rom = Room { ..Default::default() };
-    let mut cin = Cin::new(msg_tx, cin_rx);
+    let mut cin = Cin {msg_tx, cin_rx};
     loop {
         rom.name = cin.get("请输入房间名：").await;
         rom.passwd = cin.get("请输入密码：").await;
@@ -457,18 +537,12 @@ async fn join_room(serv: &mut TcpStream, msg_tx: mpsc::Sender<Msg>, cin_rx: watc
     }
 }
 
-struct Cin {
-    msg_tx: mpsc::Sender<Msg>,
-    cin_rx: watch::Receiver<String>
+struct Cin<'a> {
+    msg_tx: &'a mpsc::Sender<Msg>,
+    cin_rx: &'a mut watch::Receiver<String>
 }
 
-impl Cin {
-    fn new(msg_tx: mpsc::Sender<Msg>, cin_rx: watch::Receiver<String>) -> Self {
-        Self {
-            msg_tx, cin_rx
-        }
-    }
-
+impl Cin<'_> {
     async fn get(&mut self, msg: &str) -> String {
         self.msg_tx.send(Msg::Other(msg.to_string())).await.unwrap();
         self.cin_rx.changed().await.unwrap();
@@ -478,14 +552,13 @@ impl Cin {
 
 struct MyLogTarget {
     buf: String,
-    tx: mpsc::Sender<Msg>,
+    tx: mpsc::Sender<String>,
 }
 
 impl MyLogTarget {
-    fn new(tx: mpsc::Sender<Msg>) -> Self {
+    fn new(tx: mpsc::Sender<String>) -> Self {
         Self {
-            buf: String::new(),
-            tx
+            buf: String::new(), tx
         }
     }
 }
@@ -497,7 +570,11 @@ impl std::io::Write for MyLogTarget {
             if self.buf.contains('\n') {
                 let tx = self.tx.clone();
                 let buf = std::mem::take(&mut self.buf);
-                tokio::spawn(async move { tx.send(Msg::Log(buf)).await.unwrap(); });
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(buf).await {
+                        eprint!("{}", e);
+                    }
+                });
             }
         }
         Ok(0)
@@ -506,7 +583,11 @@ impl std::io::Write for MyLogTarget {
     fn flush(&mut self) -> Result<()> {
         let tx = self.tx.clone();
         let buf = std::mem::take(&mut self.buf);
-        tokio::spawn(async move { tx.send(Msg::Log(buf)).await.unwrap(); });
+        tokio::spawn(async move {
+            if let Err(e) = tx.send(buf).await {
+                eprint!("{}", e);
+            }
+        });
         Ok(())
     }
 }

@@ -138,7 +138,7 @@ impl CertificationCenter {
         write(&mut stm, &serde_json::to_vec(&base_info).unwrap()).await.unwrap();
         info!("{}: {:?}", &addr, &user);
         let uid = user.id;
-        let mut prcs = Process::new(user, stm, addr, rooms.clone());
+        let mut prcs = Peer::new(user, stm, addr, rooms.clone());
         prcs.poll().await.ok();
         {
             let mut users = users.lock().await;
@@ -263,7 +263,7 @@ impl AllUserInfo {
 }
 
 #[derive(Debug)]
-struct Process {
+struct Peer {
     user: User,
     stm: TcpStream,
     addr: SocketAddr,
@@ -273,10 +273,10 @@ struct Process {
     rx: mpsc::Receiver<ClientInfo>,
 }
 
-impl Process {
+impl Peer {
     fn new(user: User, stm: TcpStream, addr: SocketAddr, rooms: Arc<Mutex<AllRoomInfo>>) -> Self {
         let (tx, rx) = mpsc::channel::<ClientInfo>(64);
-        Process {
+        Peer {
             user, stm, addr, all_rooms: rooms,
             room: Vec::new(),
             tx, rx,

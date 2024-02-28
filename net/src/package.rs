@@ -1,5 +1,6 @@
 use std::{borrow::BorrowMut, result};
 
+use log::debug;
 use tokio::{
     net::TcpStream,
     io::*,
@@ -70,6 +71,7 @@ pub async fn read(stm: &mut TcpStream) -> result::Result<Vec<u8>, ErrorType> {
     }
     let len = if let Some(len) = verify_head(&len_buf) { len as usize }
                         else { return Err(ErrorType::NotPakage(Vec::from(len_buf))); };
+    debug!("net::package::read begin len: {}", len);
     let mut data: Vec<u8> = Vec::with_capacity(len);
     unsafe { data.set_len(len); }
     let rlen = match stm.read(&mut data).await {
