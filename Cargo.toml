@@ -1,3 +1,4 @@
 [workspace]
 members = ["server", "client", "net"]
 resolver = "2"
+authors = ["conch 2946859498@qq.com"]
