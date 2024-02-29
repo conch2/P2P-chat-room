@@ -54,6 +54,7 @@ async fn main() {
     if env::args().len() > 1 {
         server_addr = env::args().nth(1).unwrap();
     }
+    // 本机随机端口
     let loc_addr = {
         let mut rng = rand::thread_rng();
         let port = rng.gen_range(4000..9000);
@@ -64,6 +65,7 @@ async fn main() {
         #[cfg(target_family = "unix")]
         {server_sock.set_reuseport(true).unwrap();}
         server_sock.set_reuseaddr(true).unwrap();
+        // 绑定本地地址和端口
         server_sock.bind(loc_addr).unwrap();
         match server_sock.connect(server_addr.parse().unwrap()).await {
             Ok(sock) => { sock },
@@ -77,28 +79,29 @@ async fn main() {
     let msg_tx_clone = msg_tx.clone();
     let clients: Arc<Mutex<Vec<PeerInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let clients_ = clients.clone();
-    let (shh_tx, ssh_rx) = tokio::sync::oneshot::channel();
     let (sh_tx, sh_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         // 登录
-        let user_info = login(&mut server_stream, &msg_tx_clone, &mut cin_rx).await;
+        let user_info = if let Ok(ui) = login(&mut server_stream, &msg_tx_clone, &mut cin_rx).await {
+            ui
+        } else { return; };
         // 在克隆前先将内容清空
         cin_rx.borrow_and_update();
         // 发送房间信息
-        let room = join_room(&mut server_stream, &msg_tx_clone, &mut cin_rx).await;
+        let room = if let Ok(rom) = join_room(&mut server_stream, &msg_tx_clone, &mut cin_rx).await {
+            rom
+        } else { return; };
         info!("进入房间：{:?}", &room);
 
         cin_rx.borrow_and_update();
         init_room(&mut server_stream, &user_info, &mut cin_rx, &msg_tx_clone).await;
 
-        let server_handle = tokio::spawn(handle_server(
+        handle_server(
             server_stream, user_info, msg_tx_clone, clients_, cin_rx, sh_rx
-        ));
-        shh_tx.send(server_handle).unwrap();
+        ).await;
     });
     // 主线程来监控标准输入
     poll_user_input(&cin_tx, &msg_tx).await;
-    let server_handle = ssh_rx.await.unwrap();
     info!("正在等待所有任务结束");
     if let Err(e) = sh_tx.send(true) {
         error!("Server handle tx Send fail, {}", e);
@@ -122,6 +125,7 @@ async fn main() {
         }
         sleep(Duration::from_millis(100)).await;
     }
+    // 强制关闭所有task
     for peer in clients.lock().await.iter_mut() {
         peer.handle.abort();
     }
@@ -349,6 +353,7 @@ async fn swap_info(user_info: &User, mut sock: &mut TcpStream, addr: SocketAddr)
     Ok(other)
 }
 
+/// 当所有msg tx (Sender)关闭后才会退出
 async fn msg_handle(mut msg_rx: Receiver<Msg>) {
     let mut in_buf = String::new();
     let mut other_buf = String::new();
@@ -371,6 +376,7 @@ async fn msg_handle(mut msg_rx: Receiver<Msg>) {
             Msg::Stdin(ch) => {
                 match ch {
                     '\x0D' | '\n' => {
+                        // 回车、换行
                         if in_buf.len() != 0 {
                             in_buf.clear();
                             other_buf.clear();
@@ -493,13 +499,14 @@ impl Peer {
     }
 }
 
-async fn login(mut serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mut watch::Receiver<String>) -> User {
+/// return 
+async fn login(mut serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mut watch::Receiver<String>) -> Result<User> {
     let mut cin = Cin {msg_tx, cin_rx};
     loop {
         let mut u = User {
             id: 0,
-            name: cin.get("请输入用户名：").await,
-            passwd: cin.get("请输入密码：").await,
+            name: cin.get("请输入用户名：").await?,
+            passwd: cin.get("请输入密码：").await?,
         };
         net::write(&mut serv, u.package().unwrap().as_slice()).await.unwrap();
         let stat = net::read(&mut serv).await.unwrap();
@@ -515,23 +522,23 @@ async fn login(mut serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mu
             };
             u.id = base_info.id;
             info!("登录成功, ID: {}", u.id);
-            break u;
+            break Ok(u);
         }
         warn!("请输入正确的用户！");
     }
 }
 
-async fn join_room(serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mut watch::Receiver<String>) -> Room {
+async fn join_room(serv: &mut TcpStream, msg_tx: &mpsc::Sender<Msg>, cin_rx: &mut watch::Receiver<String>) -> Result<Room> {
     let mut rom = Room { ..Default::default() };
     let mut cin = Cin {msg_tx, cin_rx};
     loop {
-        rom.name = cin.get("请输入房间名：").await;
-        rom.passwd = cin.get("请输入密码：").await;
+        rom.name = cin.get("请输入房间名：").await?;
+        rom.passwd = cin.get("请输入密码：").await?;
         net::write(serv, rom.package().unwrap().as_slice()).await.unwrap();
         let buf = String::from_utf8(net::read(serv).await.unwrap()).unwrap();
         if buf.to_uppercase().contains("OK") {
             rom = net::read(serv).await.unwrap().into();
-            return rom;
+            return Ok(rom);
         }
         warn!("请确认房间信息是否正确！");
     }
@@ -543,10 +550,15 @@ struct Cin<'a> {
 }
 
 impl Cin<'_> {
-    async fn get(&mut self, msg: &str) -> String {
+    async fn get(&mut self, msg: &str) -> Result<String> {
         self.msg_tx.send(Msg::Other(msg.to_string())).await.unwrap();
         self.cin_rx.changed().await.unwrap();
-        self.cin_rx.borrow_and_update().clone().trim().to_string()
+        if let Some(ch) = self.cin_rx.borrow_and_update().chars().nth(0) {
+            if ch == 3 as char {
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+        }
+        Ok(self.cin_rx.borrow_and_update().clone())
     }
 }
 
