@@ -213,10 +213,9 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
                 }
             };
             let other = {
-                if let Ok(ci) = swap_info(&user_info, &mut stm,ci.addr).await {
-                    ci
-                }
-                else {
+                if let Ok(client_info) = swap_info(&user_info, &mut stm, ci.addr).await {
+                    client_info
+                } else {
                     warn!("连接{:?}失败，无法验证身份", &ci);
                     return Err(ci);
                 }

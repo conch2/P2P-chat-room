@@ -183,7 +183,10 @@ impl CertificationCenter {
                             }
                             continue;
                         },
-                        e => { debug!("{:?}", e); continue; },
+                        e => {
+                            debug!("{}: {:?}", stm.peer_addr().unwrap(), e);
+                            continue;
+                        },
                     }
                 },
             };
@@ -226,10 +229,10 @@ impl AllRoomInfo {
     }
 
     fn remove(&mut self, id: u32) -> RoomFull {
-        let r = self.by_id.remove(&id).unwrap();
-        self.by_name.remove(&r.name);
+        let room = self.by_id.remove(&id).unwrap();
+        self.by_name.remove(&room.name);
         self.unuse_id.push(id);
-        r
+        room
     }
 }
 
@@ -256,8 +259,8 @@ impl AllUserInfo {
     }
 
     fn remove(&mut self, id: ID) {
-        let u = self.by_id.remove(&id).unwrap();
-        self.by_name.remove(&u.name);
+        let user = self.by_id.remove(&id).unwrap();
+        self.by_name.remove(&user.name);
         self.unuse_id.push(id);
     }
 }
