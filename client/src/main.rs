@@ -77,8 +77,9 @@ async fn main() {
     };
     info!("已连接服务器。");
     let msg_tx_clone = msg_tx.clone();
-    let clients: Arc<Mutex<Vec<PeerInfo>>> = Arc::new(Mutex::new(Vec::new()));
-    let clients_ = clients.clone();
+    let peers: Arc<Mutex<Vec<PeerInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let peers_ = peers.clone();
+    // 用来向处理服务端的task发送退出指令
     let (sh_tx, sh_rx) = tokio::sync::oneshot::channel();
     let server_handle = tokio::spawn(async move {
         // 登录
@@ -97,7 +98,7 @@ async fn main() {
         init_room(&mut server_stream, &user_info, &mut cin_rx, &msg_tx_clone).await;
 
         handle_server(
-            server_stream, user_info, msg_tx_clone, clients_, cin_rx, sh_rx
+            server_stream, user_info, msg_tx_clone, peers_, cin_rx, sh_rx
         ).await;
     });
     // 主线程来监控标准输入
@@ -113,7 +114,7 @@ async fn main() {
         if !server_handle.is_finished() {
             finish = false;
         } else {
-            for peer in clients.lock().await.iter_mut() {
+            for peer in peers.lock().await.iter_mut() {
                 if !peer.handle.is_finished() {
                     finish = false;
                     break;
@@ -126,7 +127,7 @@ async fn main() {
         sleep(Duration::from_millis(100)).await;
     }
     // 强制关闭所有task
-    for peer in clients.lock().await.iter_mut() {
+    for peer in peers.lock().await.iter_mut() {
         peer.handle.abort();
     }
     server_handle.abort();
@@ -227,16 +228,16 @@ async fn init_room(mut server_stream: &mut TcpStream, user_info: &User,
             Ok(())
         });
     }
-    let mut e_cis: Vec<ClientInfo> = Vec::new();
+    let mut err_cis: Vec<ClientInfo> = Vec::new();
     while let Some(res) = set.join_next().await {
         if let Ok(res) = res {
             if let Err(ci) = res {
                 // 将未成功连接的回馈给服务端
-                e_cis.push(ci);
+                err_cis.push(ci);
             }
         }
     }
-    net::write(&mut server_stream, &serde_json::to_vec(&e_cis).unwrap()).await.unwrap();
+    net::write(&mut server_stream, &serde_json::to_vec(&err_cis).unwrap()).await.unwrap();
     info!("Connent Room Done.");
 }
 
@@ -404,6 +405,8 @@ async fn msg_handle(mut msg_rx: Receiver<Msg>) {
     }
 }
 
+/// 这是一个日志的中转task
+/// 用于将env_logger的日志转发到msg handle
 async fn log_handle(mut log_rx: Receiver<String>, msg_tx: Sender<Msg>) {
     loop {
         if let Some(log) = log_rx.recv().await {
@@ -412,11 +415,13 @@ async fn log_handle(mut log_rx: Receiver<String>, msg_tx: Sender<Msg>) {
     }
 }
 
+/// 当有内容要输出到stdout时, 使用这个枚举进行传递消息
 #[derive(Debug)]
 enum Msg {
     UserMsg((BaseUserInfo, String)),
     Log(String),
     Stdin(char),
+    // 通常用于不换行输出内容时
     Other(String),
 }
 
